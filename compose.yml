@@ -1,0 +1,28 @@
+services:
+  docker-control:
+    build:
+      context: .
+      args:
+        VERSION: ${DOCKER_CONTROL_VERSION:-v3.3.0}
+    restart: unless-stopped
+    environment:
+      DOCKER_CONTROL_TOKEN: ${DOCKER_CONTROL_TOKEN:?set DOCKER_CONTROL_TOKEN}
+      DOCKER_CONTROL_LISTEN: :16544
+      DOCKER_CONTROL_PUBLIC_ENDPOINT: ws://docker-control:16544
+      DOCKER_CONTROL_IMAGE: ${DOCKER_CONTROL_IMAGE:-ubuntu:22.04}
+      CONTAINER_NAME_PREFIX: ${CONTAINER_NAME_PREFIX:-sandbox}
+      SANDBOX_NETWORK: docker-control-sandbox
+      TERMINAL_IDLE_SECONDS: ${TERMINAL_IDLE_SECONDS:-300}
+      MAX_TERMINAL_WINDOWS: ${MAX_TERMINAL_WINDOWS:-40}
+    ports:
+      - 127.0.0.1:${DOCKER_CONTROL_PORT:-16544}:16544
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - control
+      - sandbox
+
+networks:
+  control:
+  sandbox:
+    name: docker-control-sandbox

@@ -1,0 +1,187 @@
+openapi: 3.1.0
+info:
+  title: docker-control API
+  version: 1.0.0
+  description: Portable managed Docker sandbox lifecycle, file and terminal interface.
+servers:
+  - url: http://localhost:16544
+security:
+  - bearerAuth: []
+paths:
+  /v1/health:
+    get:
+      security: []
+      operationId: health
+      responses:
+        "200": {description: Controller and Docker Engine health}
+  /v1/capabilities:
+    get:
+      security: []
+      operationId: capabilities
+      responses:
+        "200": {description: Supported resource and terminal protocols}
+  /v1/sandboxes:
+    get:
+      operationId: listSandboxes
+      responses:
+        "200":
+          description: Managed sandboxes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandboxes]
+                properties:
+                  sandboxes:
+                    type: array
+                    items: {$ref: "#/components/schemas/Sandbox"}
+  /v1/sandboxes/{key}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxKey"
+    put:
+      operationId: ensureSandbox
+      description: Ensures the sandbox exists. Supplying a different image safely prepares it before replacing the existing sandbox.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SandboxRequest"}
+      responses:
+        "200":
+          description: Existing or newly created sandbox
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandbox, created]
+                properties:
+                  sandbox: {$ref: "#/components/schemas/Sandbox"}
+                  created: {type: boolean}
+                  controlled_token:
+                    type: string
+                    description: Returned once when the sandbox is initially created.
+    get:
+      operationId: getSandbox
+      responses:
+        "200":
+          description: Sandbox state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandbox]
+                properties:
+                  sandbox: {$ref: "#/components/schemas/Sandbox"}
+    delete:
+      operationId: deleteSandbox
+      responses:
+        "200":
+          description: Deletion result
+  /v1/sandboxes/{key}/files:
+    parameters:
+      - $ref: "#/components/parameters/SandboxKey"
+      - name: path
+        in: query
+        required: true
+        schema: {type: string}
+    put:
+      operationId: writeSandboxFile
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200": {description: File written}
+    get:
+      operationId: readSandboxFile
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+  /v1/sandboxes/{key}/rebuild:
+    post:
+      operationId: rebuildSandbox
+      description: Prepare the requested image, then delete and recreate a severely corrupted sandbox with the same key.
+      parameters:
+        - $ref: "#/components/parameters/SandboxKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SandboxRequest"}
+      responses:
+        "200":
+          description: Rebuilt sandbox and readiness state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandbox, rebuilt]
+                properties:
+                  sandbox: {$ref: "#/components/schemas/Sandbox"}
+                  rebuilt: {type: boolean}
+  /v1/sandboxes/{key}/terminal:
+    get:
+      operationId: openTerminalWebSocket
+      description: |
+        Upgrade to WebSocket. Protocol docker-control-terminal-v1 sends
+        ready, started, output, exit, error and reclaimed events.
+      x-websocket-protocol: docker-control-terminal-v1
+      parameters:
+        - $ref: "#/components/parameters/SandboxKey"
+      responses:
+        "101": {description: WebSocket upgrade}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    SandboxKey:
+      name: key
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+        pattern: "^[a-z0-9_-]+$"
+  schemas:
+    SandboxRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        image:
+          type: string
+          maxLength: 255
+          description: Trusted management-selected image; defaults to the controller image when omitted.
+    Sandbox:
+      type: object
+      required: [id, name, key, image, state, ready, readiness, controlled_endpoint]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        key: {type: string}
+        image: {type: string}
+        state: {type: string}
+        ready: {type: boolean}
+        readiness:
+          type: string
+          enum: [starting, ready, unhealthy, stopped]
+        controlled_endpoint: {type: string}
+        created_at: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: object
+          required: [code, message, status]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            status: {type: integer}
+        message: {type: string}

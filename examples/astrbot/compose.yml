@@ -1,0 +1,37 @@
+services:
+  astrbot:
+    depends_on:
+      - docker-control
+    networks:
+      - docker-control-api
+
+  docker-control:
+    build:
+      context: ${DOCKER_CONTROL_BUILD_CONTEXT:-../../docker-control}
+    restart: unless-stopped
+    environment:
+      DOCKER_CONTROL_TOKEN: ${DOCKER_CONTROL_TOKEN:?set DOCKER_CONTROL_TOKEN}
+      DOCKER_CONTROL_LISTEN: :${DOCKER_CONTROL_PORT:-16544}
+      PORT_FALLBACKS: "0"
+      DOCKER_CONTROL_PUBLIC_ENDPOINT: ws://docker-control:${DOCKER_CONTROL_PORT:-16544}
+      DOCKER_CONTROL_IMAGE: ${DOCKER_CONTROL_IMAGE:-ubuntu:22.04}
+      CONTAINER_NAME_PREFIX: ${CONTAINER_NAME_PREFIX:-sandbox}
+      SANDBOX_NETWORK: docker-control-sandbox
+      ALLOW_NETWORK: "true"
+      MAX_CONTAINERS: "20"
+      MEMORY_BYTES: "536870912"
+      NANO_CPUS: "1000000000"
+      PIDS_LIMIT: "128"
+      WORKSPACE_BYTES: "268435456"
+      TERMINAL_IDLE_SECONDS: ${TERMINAL_IDLE_SECONDS:-300}
+      MAX_TERMINAL_WINDOWS: ${MAX_TERMINAL_WINDOWS:-40}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-control-api
+      - sandbox-control
+networks:
+  docker-control-api:
+    internal: true
+  sandbox-control:
+    name: docker-control-sandbox
