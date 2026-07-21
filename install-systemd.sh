@@ -5,10 +5,10 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 case "$(uname -m)" in
     x86_64|amd64)
-        BINARY="$ROOT/dist/docker-control-v3.3.0-linux-amd64"
+        BINARY="$ROOT/dist/docker-control-v3.4.0-linux-amd64"
         ;;
     aarch64|arm64)
-        BINARY="$ROOT/dist/docker-control-v3.3.0-linux-arm64"
+        BINARY="$ROOT/dist/docker-control-v3.4.0-linux-arm64"
         ;;
     *)
         echo "unsupported architecture: $(uname -m)" >&2

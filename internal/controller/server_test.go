@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,6 +22,8 @@ type fakeEngine struct {
 	spec      CreateSpec
 	container Container
 	removed   bool
+	snapshots []Snapshot
+	restored  bool
 }
 
 type preparingFakeEngine struct{ *fakeEngine }
@@ -206,6 +209,23 @@ func (f *fakeEngine) ReadFile(context.Context, string, string, int64) ([]byte, b
 func (f *fakeEngine) VerifyControlledToken(_ context.Context, session, token string) (bool, error) {
 	return session == f.container.Key && controlledTokenHash(token) == f.spec.ControlledTokenSHA256, nil
 }
+func (f *fakeEngine) CreateSnapshot(_ context.Context, key, name string, _ int) (Snapshot, error) {
+	snapshot := Snapshot{ID: "abcdef123456", Key: key, Name: name, Image: "docker-control-snapshot:" + key + "-abcdef123456", SourceImage: "ubuntu:22.04"}
+	f.snapshots = append(f.snapshots, snapshot)
+	return snapshot, nil
+}
+func (f *fakeEngine) ListSnapshots(context.Context, string) ([]Snapshot, error) {
+	return f.snapshots, nil
+}
+func (f *fakeEngine) RestoreSnapshot(_ context.Context, _ string, _ string, spec CreateSpec) (Container, error) {
+	f.restored = true
+	f.spec = spec
+	return Container{ID: "restored", Key: spec.Key, Name: spec.Name, Image: "ubuntu:22.04", Ready: true, Readiness: "ready"}, nil
+}
+func (f *fakeEngine) RemoveSnapshot(context.Context, string, string) (bool, error) {
+	f.snapshots = nil
+	return true, nil
+}
 
 func testConfig() Config {
 	return Config{
@@ -325,6 +345,37 @@ func TestRebuildPreservesSandboxWhileImageIsPreparing(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable || base.removed {
 		t.Fatalf("status=%d removed=%v body=%s", response.Code, base.removed, response.Body.String())
 	}
+}
+
+func TestSnapshotLifecycleRoutes(t *testing.T) {
+	engine := &fakeEngine{container: Container{ID: "id", Key: "abcdef12", Image: "ubuntu:22.04", Ready: true}}
+	handler := NewServer(testConfig(), engine)
+
+	created := authenticatedRequest(t, handler, http.MethodPost, "/v1/sandboxes/abcdef12/snapshots", `{"name":"before-ffmpeg"}`)
+	if created.Code != http.StatusCreated || len(engine.snapshots) != 1 || engine.snapshots[0].Name != "before-ffmpeg" {
+		t.Fatalf("create status=%d snapshots=%#v body=%s", created.Code, engine.snapshots, created.Body.String())
+	}
+	listed := authenticatedRequest(t, handler, http.MethodGet, "/v1/sandboxes/abcdef12/snapshots", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "abcdef123456") {
+		t.Fatalf("list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	restored := authenticatedRequest(t, handler, http.MethodPost, "/v1/sandboxes/abcdef12/snapshots/abcdef123456/restore", "")
+	if restored.Code != http.StatusOK || !engine.restored || engine.spec.ControlledToken == "" {
+		t.Fatalf("restore status=%d restored=%v spec=%#v body=%s", restored.Code, engine.restored, engine.spec, restored.Body.String())
+	}
+	deleted := authenticatedRequest(t, handler, http.MethodDelete, "/v1/sandboxes/abcdef12/snapshots/abcdef123456", "")
+	if deleted.Code != http.StatusOK || len(engine.snapshots) != 0 {
+		t.Fatalf("delete status=%d snapshots=%#v", deleted.Code, engine.snapshots)
+	}
+}
+
+func authenticatedRequest(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer manager-secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
 }
 
 func TestControlledEndpointRejectsManagerTokenAndAcceptsContainerToken(t *testing.T) {

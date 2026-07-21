@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,7 +95,7 @@ func (d *DockerEngine) Get(ctx context.Context, session string) (Container, erro
 func (d *DockerEngine) Ensure(ctx context.Context, spec CreateSpec, pullMissing bool, maxContainers int) (Container, bool, error) {
 	item, err := d.find(ctx, spec.Key)
 	if err == nil {
-		if item.Image == spec.Image {
+		if item.container().Image == spec.Image {
 			if item.State != "running" {
 				if err := d.empty(ctx, http.MethodPost, "/containers/"+url.PathEscape(item.ID)+"/start"); err != nil {
 					return Container{}, false, err
@@ -131,12 +134,20 @@ func (d *DockerEngine) Ensure(ctx context.Context, spec CreateSpec, pullMissing 
 	if !ready {
 		return Container{}, false, fmt.Errorf("%w: %s; retry after the controller finishes pulling it", ErrImagePreparing, spec.Image)
 	}
+	return d.createSandbox(ctx, spec, spec.Image, spec.Image, spec.Name, false)
+}
+
+func (d *DockerEngine) createSandbox(ctx context.Context, spec CreateSpec, runtimeImage, logicalImage, name string, restoreWorkspace bool) (Container, bool, error) {
+	startup := "mkdir -p /workspace && touch /workspace/.docker-control-ready && tail -f /dev/null"
+	if restoreWorkspace {
+		startup = "mkdir -p /workspace && if [ -d /.docker-control-snapshot/workspace ]; then cp -a /.docker-control-snapshot/workspace/. /workspace/; fi && touch /workspace/.docker-control-ready && tail -f /dev/null"
+	}
 	create := map[string]any{
-		"Image": spec.Image,
+		"Image": runtimeImage,
 		"Labels": map[string]string{
 			managedLabel: "true", keyLabel: spec.Key,
 			endpointLabel: spec.ControlledEndpoint, healthLabel: spec.ControlledHealthEndpoint,
-			tokenLabel: spec.ControlledTokenSHA256,
+			tokenLabel: spec.ControlledTokenSHA256, imageLabel: logicalImage,
 		},
 		"WorkingDir": "/workspace",
 		"Env": []string{
@@ -145,7 +156,7 @@ func (d *DockerEngine) Ensure(ctx context.Context, spec CreateSpec, pullMissing 
 			"CONTROLLED_DOCKER_HEALTH_ENDPOINT=" + spec.ControlledHealthEndpoint,
 			"CONTROLLED_DOCKER_TOKEN=" + spec.ControlledToken,
 		},
-		"Cmd":         []string{"sh", "-lc", "mkdir -p /workspace && touch /workspace/.docker-control-ready && tail -f /dev/null"},
+		"Cmd":         []string{"sh", "-lc", startup},
 		"StopTimeout": 2,
 		"Healthcheck": map[string]any{
 			"Test":     []string{"CMD-SHELL", "test -f /workspace/.docker-control-ready"},
@@ -157,14 +168,14 @@ func (d *DockerEngine) Ensure(ctx context.Context, spec CreateSpec, pullMissing 
 	var created struct {
 		ID string `json:"Id"`
 	}
-	if err := d.json(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(spec.Name), create, &created); err != nil {
+	if err := d.json(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(name), create, &created); err != nil {
 		return Container{}, false, err
 	}
 	if err := d.empty(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start"); err != nil {
 		_ = d.empty(ctx, http.MethodDelete, "/containers/"+url.PathEscape(created.ID)+"?force=true")
 		return Container{}, false, err
 	}
-	item = dockerContainerSummary{ID: created.ID, Names: []string{"/" + spec.Name}, Image: spec.Image, State: "running", Labels: map[string]string{keyLabel: spec.Key, endpointLabel: spec.ControlledEndpoint}}
+	item := dockerContainerSummary{ID: created.ID, Names: []string{"/" + name}, Image: runtimeImage, State: "running", Labels: map[string]string{keyLabel: spec.Key, endpointLabel: spec.ControlledEndpoint, imageLabel: logicalImage}}
 	container, err := d.waitForReady(ctx, item, 5*time.Second)
 	return container, true, err
 }
@@ -194,6 +205,215 @@ func (d *DockerEngine) Remove(ctx context.Context, session string) (bool, error)
 		return false, err
 	}
 	return true, nil
+}
+
+func (d *DockerEngine) CreateSnapshot(ctx context.Context, key, name string, maxSnapshots int) (Snapshot, error) {
+	if !validKey(key) || !validSnapshotName(name) {
+		return Snapshot{}, ErrInvalidSandboxKey
+	}
+	existing, err := d.ListSnapshots(ctx, key)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if len(existing) >= maxSnapshots {
+		return Snapshot{}, fmt.Errorf("%w: %d per sandbox", ErrSnapshotLimit, maxSnapshots)
+	}
+	item, err := d.requireReady(ctx, key)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	identifierBytes := make([]byte, 6)
+	if _, err := rand.Read(identifierBytes); err != nil {
+		return Snapshot{}, err
+	}
+	id := hex.EncodeToString(identifierBytes)
+	if strings.TrimSpace(name) == "" {
+		name = "restore-point-" + time.Now().UTC().Format("20060102-150405")
+	}
+	prepare, err := d.Exec(ctx, key, ExecRequest{Command: []string{"sh", "-lc", "rm -rf /.docker-control-snapshot && mkdir -p /.docker-control-snapshot"}, WorkDir: "/workspace"}, 30*time.Second, 4096)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if prepare.ExitCode != 0 {
+		return Snapshot{}, fmt.Errorf("prepare snapshot workspace: %s", prepare.Output)
+	}
+	defer func() {
+		_, _ = d.Exec(context.Background(), key, ExecRequest{Command: []string{"rm", "-rf", "/.docker-control-snapshot"}, WorkDir: "/workspace"}, 30*time.Second, 4096)
+	}()
+	if err := d.copyContainerArchive(ctx, item.ID, "/workspace", "/.docker-control-snapshot"); err != nil {
+		return Snapshot{}, fmt.Errorf("capture workspace: %w", err)
+	}
+	repository := "docker-control-snapshot"
+	tag := key + "-" + id
+	logicalImage := item.container().Image
+	query := url.Values{}
+	query.Set("container", item.ID)
+	query.Set("repo", repository)
+	query.Set("tag", tag)
+	query.Set("pause", "true")
+	for label, value := range map[string]string{
+		snapshotLabel: "true", snapshotKeyLabel: key, snapshotIDLabel: id,
+		snapshotNameLabel: name, snapshotSourceLabel: logicalImage,
+	} {
+		query.Add("changes", dockerLabelChange(label, value))
+	}
+	if err := d.empty(ctx, http.MethodPost, "/commit?"+query.Encode()); err != nil {
+		return Snapshot{}, err
+	}
+	return d.findSnapshot(ctx, key, id)
+}
+
+func (d *DockerEngine) ListSnapshots(ctx context.Context, key string) ([]Snapshot, error) {
+	if !validKey(key) {
+		return nil, ErrInvalidSandboxKey
+	}
+	return d.listSnapshots(ctx, key)
+}
+
+func (d *DockerEngine) listSnapshots(ctx context.Context, key string) ([]Snapshot, error) {
+	labels := []string{snapshotLabel + "=true"}
+	if key != "" {
+		labels = append(labels, snapshotKeyLabel+"="+key)
+	}
+	filters, _ := json.Marshal(map[string][]string{"label": labels})
+	var images []dockerImageSummary
+	if err := d.json(ctx, http.MethodGet, "/images/json?all=true&filters="+url.QueryEscape(string(filters)), nil, &images); err != nil {
+		return nil, err
+	}
+	snapshots := make([]Snapshot, 0, len(images))
+	for _, image := range images {
+		id := image.Labels[snapshotIDLabel]
+		if !validSnapshotID(id) {
+			continue
+		}
+		imageName := image.ID
+		if len(image.RepoTags) > 0 && image.RepoTags[0] != "<none>:<none>" {
+			imageName = image.RepoTags[0]
+		}
+		snapshotKey := image.Labels[snapshotKeyLabel]
+		snapshots = append(snapshots, Snapshot{
+			ID: id, Key: snapshotKey, Name: image.Labels[snapshotNameLabel], Image: imageName,
+			SourceImage: image.Labels[snapshotSourceLabel], CreatedAt: time.Unix(image.Created, 0).UTC(), SizeBytes: image.Size,
+		})
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].CreatedAt.After(snapshots[j].CreatedAt) })
+	return snapshots, nil
+}
+
+func (d *DockerEngine) RemoveAllSnapshots(ctx context.Context) ([]Snapshot, error) {
+	snapshots, err := d.listSnapshots(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	for _, snapshot := range snapshots {
+		if err := d.empty(ctx, http.MethodDelete, "/images/"+url.PathEscape(snapshot.Image)+"?force=true"); err != nil {
+			return nil, err
+		}
+	}
+	return snapshots, nil
+}
+
+func (d *DockerEngine) RestoreSnapshot(ctx context.Context, key, id string, spec CreateSpec) (Container, error) {
+	if !validKey(key) || !validSnapshotID(id) || spec.Key != key {
+		return Container{}, ErrInvalidSandboxKey
+	}
+	snapshot, err := d.findSnapshot(ctx, key, id)
+	if err != nil {
+		return Container{}, err
+	}
+	old, err := d.find(ctx, key)
+	if err != nil {
+		return Container{}, err
+	}
+	temporaryName := spec.Name + "-restore-" + id[:6]
+	container, _, err := d.createSandbox(ctx, spec, snapshot.Image, snapshot.SourceImage, temporaryName, true)
+	if err != nil {
+		return Container{}, err
+	}
+	if !container.Ready {
+		_, _ = d.removeContainerByID(ctx, container.ID)
+		return Container{}, fmt.Errorf("%w: restored container did not become ready", ErrSandboxNotReady)
+	}
+	if _, err := d.removeContainerByID(ctx, old.ID); err != nil {
+		_, _ = d.removeContainerByID(ctx, container.ID)
+		return Container{}, err
+	}
+	if err := d.empty(ctx, http.MethodPost, "/containers/"+url.PathEscape(container.ID)+"/rename?name="+url.QueryEscape(spec.Name)); err != nil {
+		return Container{}, err
+	}
+	container.Name = spec.Name
+	return container, nil
+}
+
+func (d *DockerEngine) RemoveSnapshot(ctx context.Context, key, id string) (bool, error) {
+	snapshot, err := d.findSnapshot(ctx, key, id)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := d.empty(ctx, http.MethodDelete, "/images/"+url.PathEscape(snapshot.Image)+"?force=true"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (d *DockerEngine) findSnapshot(ctx context.Context, key, id string) (Snapshot, error) {
+	if !validSnapshotID(id) {
+		return Snapshot{}, ErrNotFound
+	}
+	snapshots, err := d.ListSnapshots(ctx, key)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.ID == id {
+			return snapshot, nil
+		}
+	}
+	return Snapshot{}, ErrNotFound
+}
+
+func (d *DockerEngine) copyContainerArchive(ctx context.Context, containerID, source, destination string) error {
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, d.base+"/containers/"+url.PathEscape(containerID)+"/archive?path="+url.QueryEscape(source), nil)
+	if err != nil {
+		return err
+	}
+	response, err := d.client.Do(get)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if err := dockerStatus(response); err != nil {
+		return err
+	}
+	put, err := http.NewRequestWithContext(ctx, http.MethodPut, d.base+"/containers/"+url.PathEscape(containerID)+"/archive?path="+url.QueryEscape(destination), response.Body)
+	if err != nil {
+		return err
+	}
+	put.Header.Set("Content-Type", "application/x-tar")
+	putResponse, err := d.client.Do(put)
+	if err != nil {
+		return err
+	}
+	defer putResponse.Body.Close()
+	return dockerStatus(putResponse)
+}
+
+func (d *DockerEngine) removeContainerByID(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, nil
+	}
+	if err := d.empty(ctx, http.MethodDelete, "/containers/"+url.PathEscape(id)+"?force=true"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func dockerLabelChange(key, value string) string {
+	escaped := strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(value)
+	return fmt.Sprintf("LABEL %s=\"%s\"", key, escaped)
 }
 
 func (d *DockerEngine) Exec(ctx context.Context, session string, request ExecRequest, timeout time.Duration, maxOutput int) (ExecResult, error) {
@@ -346,6 +566,14 @@ type dockerContainerSummary struct {
 	Labels  map[string]string `json:"Labels"`
 }
 
+type dockerImageSummary struct {
+	ID       string            `json:"Id"`
+	RepoTags []string          `json:"RepoTags"`
+	Created  int64             `json:"Created"`
+	Size     int64             `json:"Size"`
+	Labels   map[string]string `json:"Labels"`
+}
+
 func (item dockerContainerSummary) container() Container {
 	name := ""
 	if len(item.Names) > 0 {
@@ -360,7 +588,11 @@ func (item dockerContainerSummary) container() Container {
 		endpoint = item.Labels[legacyEndpointLabel]
 	}
 	ready, readiness := summaryReadiness(item.State, item.Status)
-	return Container{ID: item.ID, Name: name, Key: key, Image: item.Image, State: item.State, Ready: ready, Readiness: readiness, ControlledEndpoint: endpoint, CreatedAt: time.Unix(item.Created, 0).UTC()}
+	logicalImage := item.Labels[imageLabel]
+	if logicalImage == "" {
+		logicalImage = item.Image
+	}
+	return Container{ID: item.ID, Name: name, Key: key, Image: logicalImage, State: item.State, Ready: ready, Readiness: readiness, ControlledEndpoint: endpoint, CreatedAt: time.Unix(item.Created, 0).UTC()}
 }
 
 func summaryReadiness(state, status string) (bool, string) {

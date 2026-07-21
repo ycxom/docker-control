@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +37,82 @@ func TestSandboxUsesDockerDefaultPermissionsWithoutPrivilegedMode(t *testing.T) 
 	}
 	if _, exists := host["SecurityOpt"]; exists {
 		t.Fatal("SecurityOpt must not force no-new-privileges for general-purpose software")
+	}
+}
+
+func TestContainerReportsLogicalImageAfterSnapshotRestore(t *testing.T) {
+	item := dockerContainerSummary{Image: "docker-control-snapshot:key-id", Labels: map[string]string{imageLabel: "ubuntu:22.04"}}
+	if got := item.container().Image; got != "ubuntu:22.04" {
+		t.Fatalf("logical image = %q, want ubuntu:22.04", got)
+	}
+}
+
+func TestSnapshotLabelChangeEscapesValues(t *testing.T) {
+	got := dockerLabelChange(snapshotNameLabel, `before "upgrade"`)
+	want := `LABEL io.github.ycxom.docker-control.snapshot-name="before \"upgrade\""`
+	if got != want {
+		t.Fatalf("label change = %q, want %q", got, want)
+	}
+}
+
+func TestCreateSnapshotCapturesWorkspaceAndCommitsImage(t *testing.T) {
+	var committed atomic.Bool
+	var archiveCopied atomic.Bool
+	var snapshotID string
+	engineServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.URL.Path == "/images/json":
+			if !committed.Load() {
+				_, _ = response.Write([]byte("[]"))
+				return
+			}
+			payload := []dockerImageSummary{{
+				ID: "sha256:snapshot", RepoTags: []string{"docker-control-snapshot:sandbox01-" + snapshotID},
+				Created: time.Now().Unix(), Size: 2048,
+				Labels: map[string]string{snapshotLabel: "true", snapshotKeyLabel: "sandbox01", snapshotIDLabel: snapshotID, snapshotNameLabel: "before-upgrade", snapshotSourceLabel: "ubuntu:22.04"},
+			}}
+			_ = json.NewEncoder(response).Encode(payload)
+		case request.URL.Path == "/containers/json":
+			_, _ = response.Write([]byte(`[{"Id":"container-id","Image":"ubuntu:22.04","State":"running","Status":"Up (healthy)","Labels":{"io.github.ycxom.docker-control.managed":"true","io.github.ycxom.docker-control.key":"sandbox01","io.github.ycxom.docker-control.image":"ubuntu:22.04"}}]`))
+		case request.URL.Path == "/containers/container-id/json":
+			_, _ = response.Write([]byte(`{"State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}`))
+		case request.URL.Path == "/containers/container-id/exec":
+			_, _ = response.Write([]byte(`{"Id":"exec-id"}`))
+		case request.URL.Path == "/exec/exec-id/start":
+			response.Header().Set("Content-Type", "application/octet-stream")
+		case request.URL.Path == "/exec/exec-id/json":
+			_, _ = response.Write([]byte(`{"ExitCode":0}`))
+		case request.URL.Path == "/containers/container-id/archive" && request.Method == http.MethodGet:
+			response.Header().Set("Content-Type", "application/x-tar")
+			_, _ = response.Write([]byte("workspace-archive"))
+		case request.URL.Path == "/containers/container-id/archive" && request.Method == http.MethodPut:
+			payload, _ := io.ReadAll(request.Body)
+			archiveCopied.Store(string(payload) == "workspace-archive" && request.URL.Query().Get("path") == "/.docker-control-snapshot")
+		case request.URL.Path == "/commit":
+			tag := request.URL.Query().Get("tag")
+			parts := strings.Split(tag, "-")
+			snapshotID = parts[len(parts)-1]
+			changes := strings.Join(request.URL.Query()["changes"], "\n")
+			if !strings.Contains(changes, snapshotLabel) || !strings.Contains(changes, snapshotSourceLabel) {
+				t.Fatalf("commit labels = %s", changes)
+			}
+			committed.Store(true)
+			_, _ = response.Write([]byte(`{"Id":"sha256:snapshot"}`))
+		default:
+			t.Fatalf("unexpected Docker endpoint: %s %s", request.Method, request.URL.String())
+		}
+	}))
+	defer engineServer.Close()
+	engine := NewDockerEngine(engineServer.URL, engineServer.Client())
+
+	snapshot, err := engine.CreateSnapshot(context.Background(), "sandbox01", "before-upgrade", 10)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !archiveCopied.Load() || snapshot.ID != snapshotID || snapshot.SourceImage != "ubuntu:22.04" {
+		t.Fatalf("archiveCopied=%v snapshot=%#v generatedID=%s", archiveCopied.Load(), snapshot, snapshotID)
 	}
 }
 

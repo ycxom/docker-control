@@ -19,6 +19,14 @@ const (
 	endpointLabel = "io.github.ycxom.docker-control.controlled-endpoint"
 	healthLabel   = "io.github.ycxom.docker-control.health-endpoint"
 	tokenLabel    = "io.github.ycxom.docker-control.token-sha256"
+	imageLabel    = "io.github.ycxom.docker-control.image"
+
+	snapshotLabel       = "io.github.ycxom.docker-control.snapshot"
+	snapshotKeyLabel    = "io.github.ycxom.docker-control.snapshot-key"
+	snapshotIDLabel     = "io.github.ycxom.docker-control.snapshot-id"
+	snapshotNameLabel   = "io.github.ycxom.docker-control.snapshot-name"
+	snapshotSourceLabel = "io.github.ycxom.docker-control.snapshot-source-image"
+	maxSnapshotsPerKey  = 10
 
 	legacyManagedLabel  = "astrbot.plugin.docker_sandbox.managed"
 	legacyKeyLabel      = "astrbot.plugin.docker_sandbox.session"
@@ -150,6 +158,20 @@ type CreateRequest struct {
 	Image string `json:"image,omitempty"`
 }
 
+type SnapshotRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type Snapshot struct {
+	ID          string    `json:"id"`
+	Key         string    `json:"key"`
+	Name        string    `json:"name"`
+	Image       string    `json:"image"`
+	SourceImage string    `json:"source_image"`
+	CreatedAt   time.Time `json:"created_at"`
+	SizeBytes   int64     `json:"size_bytes"`
+}
+
 type ExecRequest struct {
 	Command []string `json:"command"`
 	WorkDir string   `json:"workdir,omitempty"`
@@ -189,10 +211,18 @@ type Engine interface {
 	ReadFile(context.Context, string, string, int64) ([]byte, bool, error)
 }
 
+type SnapshotEngine interface {
+	CreateSnapshot(context.Context, string, string, int) (Snapshot, error)
+	ListSnapshots(context.Context, string) ([]Snapshot, error)
+	RestoreSnapshot(context.Context, string, string, CreateSpec) (Container, error)
+	RemoveSnapshot(context.Context, string, string) (bool, error)
+}
+
 var ErrNotFound = errors.New("not found")
 var ErrImagePreparing = errors.New("sandbox image is being prepared")
 var ErrSandboxNotReady = errors.New("sandbox is not ready")
 var ErrInvalidSandboxKey = errors.New("invalid sandbox key")
+var ErrSnapshotLimit = errors.New("snapshot limit reached")
 
 func validKey(value string) bool {
 	if len(value) < 8 || len(value) > 64 {
@@ -209,6 +239,23 @@ func validKey(value string) bool {
 func validImage(value string) bool {
 	value = strings.TrimSpace(value)
 	return value != "" && len(value) <= 255 && !strings.ContainsAny(value, "\r\n\x00")
+}
+
+func validSnapshotID(value string) bool {
+	if len(value) != 12 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= 'a' && char <= 'f') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSnapshotName(value string) bool {
+	value = strings.TrimSpace(value)
+	return len(value) <= 64 && !strings.ContainsAny(value, "\r\n\x00")
 }
 
 func validNamePrefix(value string) bool {

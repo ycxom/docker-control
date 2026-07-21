@@ -25,7 +25,7 @@ New sandboxes only receive generic labels. Legacy labels are read but never writ
 ## systemd migration
 
 ```bash
-sudo ./docker-control-v3.3.0-linux-amd64 install --migrate-legacy
+sudo ./docker-control-v3.4.0-linux-amd64 install --migrate-legacy
 ```
 
 This explicitly imports the old environment file, disables the former service, installs the new unit,

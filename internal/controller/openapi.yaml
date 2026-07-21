@@ -123,6 +123,52 @@ paths:
                 properties:
                   sandbox: {$ref: "#/components/schemas/Sandbox"}
                   rebuilt: {type: boolean}
+  /v1/sandboxes/{key}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/SandboxKey"
+    get:
+      operationId: listSnapshots
+      responses:
+        "200":
+          description: Restore points for the sandbox, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshots]
+                properties:
+                  snapshots:
+                    type: array
+                    items: {$ref: "#/components/schemas/Snapshot"}
+    post:
+      operationId: createSnapshot
+      description: Capture the container filesystem and /workspace as a durable restore point.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SnapshotRequest"}
+      responses:
+        "201":
+          description: Snapshot created
+  /v1/sandboxes/{key}/snapshots/{id}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxKey"
+      - $ref: "#/components/parameters/SnapshotID"
+    delete:
+      operationId: deleteSnapshot
+      responses:
+        "200": {description: Snapshot deletion result}
+  /v1/sandboxes/{key}/snapshots/{id}/restore:
+    parameters:
+      - $ref: "#/components/parameters/SandboxKey"
+      - $ref: "#/components/parameters/SnapshotID"
+    post:
+      operationId: restoreSnapshot
+      description: Start and verify the restored container before replacing the current sandbox.
+      responses:
+        "200":
+          description: Restored and ready sandbox
   /v1/sandboxes/{key}/terminal:
     get:
       operationId: openTerminalWebSocket
@@ -149,6 +195,13 @@ components:
         minLength: 8
         maxLength: 64
         pattern: "^[a-z0-9_-]+$"
+    SnapshotID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-f0-9]{12}$"
   schemas:
     SandboxRequest:
       type: object
@@ -173,6 +226,22 @@ components:
           enum: [starting, ready, unhealthy, stopped]
         controlled_endpoint: {type: string}
         created_at: {type: string, format: date-time}
+    SnapshotRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: string, maxLength: 64}
+    Snapshot:
+      type: object
+      required: [id, key, name, image, source_image, created_at, size_bytes]
+      properties:
+        id: {type: string}
+        key: {type: string}
+        name: {type: string}
+        image: {type: string}
+        source_image: {type: string}
+        created_at: {type: string, format: date-time}
+        size_bytes: {type: integer, format: int64}
     Error:
       type: object
       required: [error, message]

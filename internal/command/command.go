@@ -604,6 +604,13 @@ func cleanManagedSandboxes(layout Layout, stdout io.Writer) error {
 			_, _ = fmt.Fprintf(stdout, "removed sandbox %s (%s)\n", sandbox.Key, sandbox.ID)
 		}
 	}
+	snapshots, err := engine.RemoveAllSnapshots(ctx)
+	if err != nil {
+		return err
+	}
+	for _, snapshot := range snapshots {
+		_, _ = fmt.Fprintf(stdout, "removed snapshot %s/%s (%s)\n", snapshot.Key, snapshot.ID, snapshot.Name)
+	}
 	return nil
 }
 

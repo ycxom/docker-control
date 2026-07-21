@@ -30,6 +30,10 @@ func NewServer(cfg Config, engine Engine) http.Handler {
 	server.mux.HandleFunc("GET /v1/sandboxes/{key}", server.getContainer)
 	server.mux.HandleFunc("DELETE /v1/sandboxes/{key}", server.deleteContainer)
 	server.mux.HandleFunc("POST /v1/sandboxes/{key}/rebuild", server.rebuildContainer)
+	server.mux.HandleFunc("GET /v1/sandboxes/{key}/snapshots", server.listSnapshots)
+	server.mux.HandleFunc("POST /v1/sandboxes/{key}/snapshots", server.createSnapshot)
+	server.mux.HandleFunc("POST /v1/sandboxes/{key}/snapshots/{id}/restore", server.restoreSnapshot)
+	server.mux.HandleFunc("DELETE /v1/sandboxes/{key}/snapshots/{id}", server.deleteSnapshot)
 	server.mux.HandleFunc("GET /v1/sandboxes/{key}/terminal", server.managementTerminal)
 	server.mux.HandleFunc("PUT /v1/sandboxes/{key}/files", server.writeFile)
 	server.mux.HandleFunc("GET /v1/sandboxes/{key}/files", server.readFile)
@@ -62,7 +66,7 @@ func (s *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) 
 func (s *Server) capabilities(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, map[string]any{
 		"name": "docker-control", "api_version": "v1",
-		"resources":         []string{"sandboxes", "files", "terminal"},
+		"resources":         []string{"sandboxes", "snapshots", "files", "terminal"},
 		"terminal_protocol": "docker-control-terminal-v1",
 		"legacy_routes":     []string{"/v1/containers"},
 	})
@@ -129,28 +133,112 @@ func (s *Server) ensureContainer(response http.ResponseWriter, request *http.Req
 }
 
 func (s *Server) ensureSandbox(ctx context.Context, key, image string) (Container, bool, string, error) {
+	spec, token, err := s.newSandboxSpec(key, image)
+	if err != nil {
+		return Container{}, false, "", err
+	}
+	container, created, err := s.engine.Ensure(ctx, spec, s.cfg.PullMissingImage, s.cfg.MaxContainers)
+	if err != nil {
+		return Container{}, false, "", err
+	}
+	return container, created, token, nil
+}
+
+func (s *Server) newSandboxSpec(key, image string) (CreateSpec, string, error) {
 	if !validKey(key) {
-		return Container{}, false, "", ErrInvalidSandboxKey
+		return CreateSpec{}, "", ErrInvalidSandboxKey
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		return Container{}, false, "", errors.New("cannot generate controlled endpoint token")
+		return CreateSpec{}, "", errors.New("cannot generate controlled endpoint token")
 	}
 	token := hex.EncodeToString(tokenBytes)
 	endpoint := endpointFor(s.cfg.PublicEndpoint, key)
 	healthEndpoint := healthEndpointFor(s.cfg.PublicEndpoint, key)
-	container, created, err := s.engine.Ensure(ctx, CreateSpec{
+	spec := CreateSpec{
 		Key: key, Name: s.cfg.ContainerNamePrefix + "-" + key, Image: image,
 		NetworkMode: s.cfg.SandboxNetwork, MemoryBytes: s.cfg.MemoryBytes,
 		NanoCPUs: s.cfg.NanoCPUs, PIDsLimit: s.cfg.PIDsLimit,
 		WorkspaceBytes: s.cfg.WorkspaceBytes, ControlledEndpoint: endpoint,
 		ControlledHealthEndpoint: healthEndpoint,
 		ControlledToken:          token, ControlledTokenSHA256: controlledTokenHash(token),
-	}, s.cfg.PullMissingImage, s.cfg.MaxContainers)
-	if err != nil {
-		return Container{}, false, "", err
 	}
-	return container, created, token, nil
+	return spec, token, nil
+}
+
+func (s *Server) createSnapshot(response http.ResponseWriter, request *http.Request) {
+	engine, ok := s.engine.(SnapshotEngine)
+	if !ok {
+		writeError(response, http.StatusNotImplemented, "snapshot engine is unavailable")
+		return
+	}
+	var payload SnapshotRequest
+	if request.Body != nil && request.ContentLength != 0 {
+		decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
+			writeError(response, http.StatusBadRequest, "invalid snapshot request: "+err.Error())
+			return
+		}
+	}
+	if !validSnapshotName(payload.Name) {
+		writeError(response, http.StatusBadRequest, "snapshot name must be at most 64 characters without control characters")
+		return
+	}
+	snapshot, err := engine.CreateSnapshot(request.Context(), request.PathValue("key"), strings.TrimSpace(payload.Name), maxSnapshotsPerKey)
+	if err != nil {
+		writeEngineError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, map[string]any{"snapshot": snapshot})
+}
+
+func (s *Server) listSnapshots(response http.ResponseWriter, request *http.Request) {
+	engine, ok := s.engine.(SnapshotEngine)
+	if !ok {
+		writeError(response, http.StatusNotImplemented, "snapshot engine is unavailable")
+		return
+	}
+	snapshots, err := engine.ListSnapshots(request.Context(), request.PathValue("key"))
+	if err != nil {
+		writeEngineError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"snapshots": snapshots})
+}
+
+func (s *Server) restoreSnapshot(response http.ResponseWriter, request *http.Request) {
+	engine, ok := s.engine.(SnapshotEngine)
+	if !ok {
+		writeError(response, http.StatusNotImplemented, "snapshot engine is unavailable")
+		return
+	}
+	key := request.PathValue("key")
+	spec, token, err := s.newSandboxSpec(key, s.cfg.Image)
+	if err != nil {
+		writeEngineError(response, err)
+		return
+	}
+	container, err := engine.RestoreSnapshot(request.Context(), key, request.PathValue("id"), spec)
+	if err != nil {
+		writeEngineError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"sandbox": container, "restored": true, "controlled_token": token})
+}
+
+func (s *Server) deleteSnapshot(response http.ResponseWriter, request *http.Request) {
+	engine, ok := s.engine.(SnapshotEngine)
+	if !ok {
+		writeError(response, http.StatusNotImplemented, "snapshot engine is unavailable")
+		return
+	}
+	removed, err := engine.RemoveSnapshot(request.Context(), request.PathValue("key"), request.PathValue("id"))
+	if err != nil {
+		writeEngineError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"removed": removed})
 }
 
 func (s *Server) rebuildContainer(response http.ResponseWriter, request *http.Request) {
@@ -348,6 +436,8 @@ func writeEngineError(response http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	} else if errors.Is(err, ErrImagePreparing) || errors.Is(err, ErrSandboxNotReady) {
 		status = http.StatusServiceUnavailable
+	} else if errors.Is(err, ErrSnapshotLimit) {
+		status = http.StatusConflict
 	}
 	writeError(response, status, err.Error())
 }

@@ -16,13 +16,14 @@ Sandbox 使用 Docker 默认的非特权权限集，明确设置 `Privileged=fal
 capabilities 或强制 `no-new-privileges`。这允许 APT、dpkg、编译器和常见工具正常工作，
 但不会挂载 Docker Socket 或宿主机目录，也不会以 `--privileged` 模式启动。
 
-## v3.3.0 发布说明
+## v3.4.0 发布说明
 
 - 沙箱恢复 Docker 默认非特权 capabilities，支持 `apt-get`、`dpkg` 和多语言工具链；
 - 始终保持 `Privileged=false`，不提供 Docker Socket 或宿主机目录；
 - 默认端口为 `16544`，端口占用时可自动选择后续端口；
 - 支持安全切换自定义镜像、readiness 状态、会话重建和实时 WebSocket 终端；
 - 单一二进制提供 `server`、`install`、`uninstall`、`status`、`config` 和 `version`。
+- 支持容器系统层与 `/workspace` 的持久化还原点，可快速创建、列出、恢复和删除。
 
 从 v3.2.0 或更早版本升级时，替换并重启控制器后，需要重建既有 sandbox 才能应用
 新的容器权限配置。新建容器无需额外参数：
@@ -47,6 +48,10 @@ PUT    /v1/sandboxes/{key}
 GET    /v1/sandboxes/{key}
 DELETE /v1/sandboxes/{key}
 POST   /v1/sandboxes/{key}/rebuild
+GET    /v1/sandboxes/{key}/snapshots
+POST   /v1/sandboxes/{key}/snapshots
+POST   /v1/sandboxes/{key}/snapshots/{id}/restore
+DELETE /v1/sandboxes/{key}/snapshots/{id}
 GET/WS /v1/sandboxes/{key}/terminal
 PUT    /v1/sandboxes/{key}/files?path=...
 GET    /v1/sandboxes/{key}/files?path=...
@@ -94,6 +99,30 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 时，控制器先在后台拉取并返回 503；确认新镜像可用后再次请求才替换旧容器，避免切换
 失败导致可用环境提前丢失。
 
+## 还原点与快速恢复
+
+还原点同时捕获容器可写系统层（已安装软件、系统配置）和 `/workspace`。它们以带受管
+标签的本地 Docker 镜像持久化，控制器重启后仍可使用；每个 sandbox 最多 10 个。
+
+```bash
+# 创建
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"before-ffmpeg-upgrade"}' \
+  http://127.0.0.1:16544/v1/sandboxes/my-client-001/snapshots
+
+# 列出
+curl -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:16544/v1/sandboxes/my-client-001/snapshots
+
+# 恢复
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:16544/v1/sandboxes/my-client-001/snapshots/<snapshot-id>/restore
+```
+
+恢复会先用快照启动临时容器并等待 readiness，通过后才替换当前容器。删除 sandbox
+不会自动删除其还原点，便于重新创建后恢复；`uninstall` 默认会清理所有受管还原点。
+
 ## WebSocket 终端
 
 ```text
@@ -133,7 +162,7 @@ CONTROLLED_DOCKER_TOKEN=<每个 sandbox 独立令牌>
 单一二进制已经融合配置、运行、安装和卸载能力。首次前台启动：
 
 ```bash
-./dist/docker-control-v3.3.0-linux-amd64 server \
+./dist/docker-control-v3.4.0-linux-amd64 server \
   --port 16544 \
   --port-fallbacks 20 \
   --image ubuntu:22.04 \
@@ -192,8 +221,8 @@ examples/astrbot/compose.yml
 不需要解压额外安装脚本，Linux 二进制可直接自安装：
 
 ```bash
-chmod +x docker-control-v3.3.0-linux-amd64
-sudo ./docker-control-v3.3.0-linux-amd64 install \
+chmod +x docker-control-v3.4.0-linux-amd64
+sudo ./docker-control-v3.4.0-linux-amd64 install \
   --port 16544 \
   --image ubuntu:22.04
 ```
@@ -210,7 +239,7 @@ $PWD/.docker-control/runtime.json
 需要指定其他项目目录时使用 `--home`：
 
 ```bash
-sudo ./docker-control-v3.3.0-linux-amd64 install --home /srv/docker-control
+sudo ./docker-control-v3.4.0-linux-amd64 install --home /srv/docker-control
 ```
 
 脚本不会把项目文件复制到 `/usr/local`、`/etc/docker-control` 或 `/run`。为了实现系统
@@ -225,7 +254,7 @@ journalctl -u docker-control -f
 从旧 AstrBot 命名版本迁移：
 
 ```bash
-sudo ./docker-control-v3.3.0-linux-amd64 install --migrate-legacy
+sudo ./docker-control-v3.4.0-linux-amd64 install --migrate-legacy
 ```
 
 详见 [MIGRATION.md](MIGRATION.md)。
@@ -268,11 +297,11 @@ v2 环境变量仍可读取，便于滚动迁移。
 ## 构建与验证
 
 ```powershell
-.\build-release.ps1 -Version v3.3.0
+.\build-release.ps1 -Version v3.4.0
 ```
 
 ```bash
-./build-release.sh v3.3.0
+./build-release.sh v3.4.0
 go test ./...
 go vet ./...
 ```
